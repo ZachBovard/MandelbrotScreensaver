@@ -1,19 +1,13 @@
-using Silk.NET.Core.Native;
-using Silk.NET.Direct3D.Compilers;
-using Silk.NET.Direct3D11;
-using Silk.NET.DXGI;
 using Silk.NET.Input;
 using Silk.NET.Maths;
+using Silk.NET.OpenGL;
 using Silk.NET.Windowing;
 using System.Numerics;
-using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
-using System.Text;
 using System.Windows.Forms;
 
 namespace MandelbrotScreensaver;
 
-internal static unsafe class Program
+internal static class Program
 {
     // Zoom speed in "doublings" per second. One journey = JourneyLength doublings
     // (12 / 0.055 ≈ 218 s ≈ 3.6 minutes), then it fades out and starts again.
@@ -40,36 +34,23 @@ internal static unsafe class Program
     private const double MouseGraceSeconds = 1.0;
     private const float MouseMoveThreshold = 15f;
 
-    // Must match the cbuffer in the shader (two 16-byte rows).
-    [StructLayout(LayoutKind.Sequential)]
-    private struct FractalParams
-    {
-        public Vector2 Resolution;
-        public float Time;
-        public float Journey;
-
-        public float JourneyLength;
-        public int MaxIterations;
-        public Vector2 Center;
-    }
-
     private static IWindow? window;
+    private static GL? gl;
     private static IInputContext? input;
 
-    private static DXGI? dxgi;
-    private static D3D11? d3d11;
-    private static D3DCompiler? compiler;
+    private static uint shaderProgram;
+    private static uint vertexArray;
 
-    private static ComPtr<IDXGIFactory6> factory = default;
-    private static ComPtr<IDXGIAdapter> adapter = default;
-    private static ComPtr<ID3D11Device> device = default;
-    private static ComPtr<ID3D11DeviceContext> deviceContext = default;
-    private static ComPtr<IDXGISwapChain1> swapchain = default;
-    private static ComPtr<ID3D11VertexShader> vertexShader = default;
-    private static ComPtr<ID3D11PixelShader> pixelShader = default;
-    private static ComPtr<ID3D11Buffer> constantBuffer = default;
+    private static int resolutionLocation;
+    private static int originLocation;
+    private static int timeLocation;
+    private static int journeyLocation;
+    private static int journeyLengthLocation;
+    private static int maxIterationsLocation;
+    private static int centerLocation;
 
-    private static readonly float[] Black = [0f, 0f, 0f, 1f];
+    // The window covers every monitor; the fractal fills all of it.
+    private static System.Drawing.Rectangle desktopBounds;
 
     private static double startTime;
     private static Vector2 initialMouse;
@@ -78,6 +59,11 @@ internal static unsafe class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        // Hint for NVIDIA Optimus laptops: a program that loads NVIDIA's API
+        // library before creating its OpenGL window gets the GeForce instead
+        // of the Intel chip. On PCs without NVIDIA this fails quietly.
+        System.Runtime.InteropServices.NativeLibrary.TryLoad("nvapi64.dll", out _);
+
         // Must run before reading screen sizes, or the window won't cover
         // the whole desktop when Windows display scaling is above 100%.
         Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
@@ -103,23 +89,28 @@ internal static unsafe class Program
         if (!option.StartsWith("/s"))
             return;
 
-        System.Drawing.Rectangle desktop = SystemInformation.VirtualScreen;
+        desktopBounds = SystemInformation.VirtualScreen;
 
         zoomTarget = ZoomTargets[Random.Shared.Next(ZoomTargets.Length)];
 
         WindowOptions options = WindowOptions.Default;
         options.Title = "Mandelbrot Screensaver";
-        options.Size = new Vector2D<int>(desktop.Width, desktop.Height);
-        options.Position = new Vector2D<int>(desktop.X, desktop.Y);
+        options.Size = new Vector2D<int>(desktopBounds.Width, desktopBounds.Height);
+        options.Position = new Vector2D<int>(desktopBounds.X, desktopBounds.Y);
         options.WindowBorder = WindowBorder.Hidden;
         options.WindowState = WindowState.Normal;
-        options.API = GraphicsAPI.None;   // Direct3D 11, not OpenGL
+        options.VSync = true;
+        options.ShouldSwapAutomatically = true;
+        options.API = new GraphicsAPI(
+            ContextAPI.OpenGL,
+            ContextProfile.Core,
+            ContextFlags.Default,
+            new APIVersion(3, 3));
 
         window = Window.Create(options);
 
         window.Load += OnLoad;
         window.Render += OnRender;
-        window.FramebufferResize += OnFramebufferResize;
         window.Closing += OnClosing;
 
         window.Run();
@@ -133,6 +124,7 @@ internal static unsafe class Program
 
         IWindow w = window;
 
+        gl = GL.GetApi(w);
         startTime = w.Time;
 
         input = w.CreateInput();
@@ -168,105 +160,52 @@ internal static unsafe class Program
             };
         }
 
-        dxgi = DXGI.GetApi(w, false);
-        d3d11 = D3D11.GetApi(w, false);
-        compiler = D3DCompiler.GetApi();
+        const string vertexShaderSource = """
+            #version 330 core
 
-        // Ask Windows for the high-performance GPU (the GeForce on an
-        // Optimus laptop) and build the device on it directly. This is
-        // the step OpenGL could not do.
-        factory = dxgi.CreateDXGIFactory1<IDXGIFactory6>();
+            const vec2 vertices[3] = vec2[](
+                vec2(-1.0, -1.0),
+                vec2( 3.0, -1.0),
+                vec2(-1.0,  3.0)
+            );
 
-        int adapterResult = factory.EnumAdapterByGpuPreference(
-            0, GpuPreference.HighPerformance, out adapter);
-
-        if (adapterResult >= 0)
-        {
-            SilkMarshal.ThrowHResult(
-                d3d11.CreateDevice(
-                    adapter,
-                    D3DDriverType.Unknown,      // required when an adapter is given
-                    default,
-                    0,
-                    null,
-                    0,
-                    D3D11.SdkVersion,
-                    ref device,
-                    null,
-                    ref deviceContext));
-        }
-        else
-        {
-            // No adapter list available: let Windows pick.
-            SilkMarshal.ThrowHResult(
-                d3d11.CreateDevice(
-                    default(ComPtr<IDXGIAdapter>),
-                    D3DDriverType.Hardware,
-                    default,
-                    0,
-                    null,
-                    0,
-                    D3D11.SdkVersion,
-                    ref device,
-                    null,
-                    ref deviceContext));
-        }
-
-        var swapChainDesc = new SwapChainDesc1
-        {
-            BufferCount = 2,
-            Format = Format.FormatB8G8R8A8Unorm,
-            BufferUsage = DXGI.UsageRenderTargetOutput,
-            SwapEffect = SwapEffect.Discard,   // blit model, like OpenGL; flip model stuttered across mixed monitors
-            SampleDesc = new SampleDesc(1, 0)
-        };
-
-        SilkMarshal.ThrowHResult(
-            factory.CreateSwapChainForHwnd(
-                device,
-                w.Native!.DXHandle!.Value,
-                in swapChainDesc,
-                null,
-                ref Unsafe.NullRef<IDXGIOutput>(),
-                ref swapchain));
-
-        const string shaderSource = """
-            cbuffer FractalParams : register(b0)
+            void main()
             {
-                float2 uResolution;     // size of the drawing area (all monitors)
-                float  uTime;
-                float  uJourney;        // 0 .. uJourneyLength, computed on CPU in double
-                float  uJourneyLength;
-                int    uMaxIterations;  // grows with zoom depth
-                float2 uCenter;         // zoom target, picked at random on start
-            };
-
-            static const float LOG2 = 0.69314718056;
-
-            // One triangle that covers the whole screen.
-            float4 vs_main(uint id : SV_VertexID) : SV_POSITION
-            {
-                float2 uv = float2((id << 1) & 2, id & 2);
-                return float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+                gl_Position = vec4(vertices[gl_VertexID], 0.0, 1.0);
             }
+            """;
 
-            float3 palette(float value)
+        const string fragmentShaderSource = """
+            #version 330 core
+
+            out vec4 FragColor;
+
+            uniform vec2  uResolution;     // size of the drawing area (all monitors)
+            uniform vec2  uOrigin;         // its bottom-left corner in window pixels
+            uniform float uTime;
+            uniform float uJourney;        // 0 .. uJourneyLength, computed on CPU in double
+            uniform float uJourneyLength;
+            uniform int   uMaxIterations;  // grows with zoom depth
+            uniform vec2  uCenter;         // zoom target, picked at random on start
+
+            const float LOG2 = 0.69314718056;
+
+            vec3 palette(float value)
             {
-                float3 baseColor = float3(0.08, 0.07, 0.15);
-                float3 amplitude = float3(0.48, 0.42, 0.56);
-                float3 frequency = float3(1.00, 0.82, 0.68);
-                float3 phase     = float3(0.10, 0.29, 0.54);
+                vec3 base      = vec3(0.08, 0.07, 0.15);
+                vec3 amplitude = vec3(0.48, 0.42, 0.56);
+                vec3 frequency = vec3(1.00, 0.82, 0.68);
+                vec3 phase     = vec3(0.10, 0.29, 0.54);
 
-                return baseColor + amplitude *
+                return base + amplitude *
                     cos(6.28318530718 * (frequency * value + phase));
             }
 
             // Smooth (fractional) escape count, or -1.0 for points inside the set.
-            float calculateMandelbrot(float2 c)
+            float calculateMandelbrot(vec2 c)
             {
-                float2 z = float2(0.0, 0.0);
+                vec2 z = vec2(0.0);
 
-                [loop]
                 for (int i = 0; i < uMaxIterations; i++)
                 {
                     float xx = z.x * z.x;
@@ -276,36 +215,38 @@ internal static unsafe class Program
                     {
                         float logMagnitude = 0.5 * log(xx + yy);
                         float correction = log(logMagnitude / LOG2) / LOG2;
-                        return (float)i + 1.0 - correction;
+                        return float(i) + 1.0 - correction;
                     }
 
-                    z = float2(xx - yy + c.x, 2.0 * z.x * z.y + c.y);
+                    z = vec2(xx - yy + c.x, 2.0 * z.x * z.y + c.y);
                 }
 
                 return -1.0;
             }
 
-            float3 renderFractal(float2 coordinate)
+            vec3 renderFractal(vec2 coordinate)
             {
-                float2 uv = (2.0 * coordinate - uResolution) / uResolution.y;
+                vec2 uv = (2.0 * coordinate - uResolution) / uResolution.y;
 
                 float zoom = exp2(1.0 + uJourney);
 
-                float2 drift = float2(
+                vec2 center = uCenter;
+
+                vec2 drift = vec2(
                     sin(uTime * 0.035),
                     cos(uTime * 0.029)
                 ) * (0.008 / zoom);
 
-                float2 fractalCoordinate = uCenter + drift + uv * (1.7 / zoom);
+                vec2 fractalCoordinate = center + drift + uv * (1.7 / zoom);
 
                 float iterations = calculateMandelbrot(fractalCoordinate);
 
                 if (iterations < 0.0)
-                    return float3(0.0015, 0.0020, 0.0070);
+                    return vec3(0.0015, 0.0020, 0.0070);
 
                 float colorPosition = iterations * 0.018 + uTime * 0.0025;
 
-                float3 color = lerp(
+                vec3 color = mix(
                     palette(colorPosition),
                     palette(colorPosition * 0.62 + 0.25),
                     0.25);
@@ -316,22 +257,22 @@ internal static unsafe class Program
                 return color;
             }
 
-            float4 ps_main(float4 position : SV_POSITION) : SV_TARGET
+            void main()
             {
-                // Direct3D counts pixels from the top; flip so the image
-                // matches the OpenGL version (counted from the bottom).
-                float2 coordinate = float2(position.x, uResolution.y - position.y);
+                // gl_FragCoord is relative to the whole window; uOrigin is 0
+                // now that the fractal fills every monitor.
+                vec2 coordinate = gl_FragCoord.xy - uOrigin;
 
-                float3 color = renderFractal(coordinate);
+                vec3 color = renderFractal(coordinate);
 
-                float2 screenPosition =
+                vec2 screenPosition =
                     (2.0 * coordinate - uResolution) / uResolution.y;
 
                 float vignette = 1.0 - 0.11 * dot(screenPosition, screenPosition);
                 color *= clamp(vignette, 0.45, 1.0);
 
                 color = color / (1.0 + color);                       // tone map
-                color = pow(max(color, (float3)0.0), (float3)0.82);
+                color = pow(max(color, vec3(0.0)), vec3(0.82));
 
                 // Fade to black at the end of each journey and back in at the
                 // start, instead of snapping from deep zoom to wide view.
@@ -339,87 +280,62 @@ internal static unsafe class Program
                 float fadeOut = 1.0 - smoothstep(uJourneyLength - 0.3, uJourneyLength, uJourney);
                 color *= fadeIn * fadeOut;
 
-                return float4(color, 1.0);
+                FragColor = vec4(color, 1.0);
             }
             """;
 
-        byte[] shaderBytes = Encoding.ASCII.GetBytes(shaderSource);
+        uint vertexShader = CompileShader(ShaderType.VertexShader, vertexShaderSource);
+        uint fragmentShader = CompileShader(ShaderType.FragmentShader, fragmentShaderSource);
 
-        ComPtr<ID3D10Blob> vertexCode = CompileShader(shaderBytes, "vs_main", "vs_5_0");
-        ComPtr<ID3D10Blob> pixelCode = CompileShader(shaderBytes, "ps_main", "ps_5_0");
+        shaderProgram = gl.CreateProgram();
 
-        SilkMarshal.ThrowHResult(
-            device.CreateVertexShader(
-                vertexCode.GetBufferPointer(),
-                vertexCode.GetBufferSize(),
-                ref Unsafe.NullRef<ID3D11ClassLinkage>(),
-                ref vertexShader));
+        gl.AttachShader(shaderProgram, vertexShader);
+        gl.AttachShader(shaderProgram, fragmentShader);
+        gl.LinkProgram(shaderProgram);
 
-        SilkMarshal.ThrowHResult(
-            device.CreatePixelShader(
-                pixelCode.GetBufferPointer(),
-                pixelCode.GetBufferSize(),
-                ref Unsafe.NullRef<ID3D11ClassLinkage>(),
-                ref pixelShader));
+        gl.GetProgram(shaderProgram, ProgramPropertyARB.LinkStatus, out int linkStatus);
 
-        vertexCode.Dispose();
-        pixelCode.Dispose();
-
-        var bufferDesc = new BufferDesc
+        if (linkStatus == 0)
         {
-            ByteWidth = (uint)sizeof(FractalParams),
-            Usage = Usage.Default,
-            BindFlags = (uint)BindFlag.ConstantBuffer
-        };
-
-        SilkMarshal.ThrowHResult(
-            device.CreateBuffer(in bufferDesc, null, ref constantBuffer));
-    }
-
-    private static ComPtr<ID3D10Blob> CompileShader(byte[] source, string entryPoint, string target)
-    {
-        if (compiler is null)
-            throw new InvalidOperationException();
-
-        ComPtr<ID3D10Blob> code = default;
-        ComPtr<ID3D10Blob> errors = default;
-
-        HResult hr = compiler.Compile(
-            in source[0],
-            (nuint)source.Length,
-            "MandelbrotShader",
-            null,
-            ref Unsafe.NullRef<ID3DInclude>(),
-            entryPoint,
-            target,
-            0,
-            0,
-            ref code,
-            ref errors);
-
-        if (hr.IsFailure)
-        {
-            string message = errors.Handle is not null
-                ? SilkMarshal.PtrToString((nint)errors.GetBufferPointer()) ?? ""
-                : "";
-
-            errors.Dispose();
-            throw new Exception($"Shader compilation error ({entryPoint}):\n{message}");
+            throw new Exception(
+                "Shader link error:\n" + gl.GetProgramInfoLog(shaderProgram));
         }
 
-        errors.Dispose();
-        return code;
+        gl.DetachShader(shaderProgram, vertexShader);
+        gl.DetachShader(shaderProgram, fragmentShader);
+        gl.DeleteShader(vertexShader);
+        gl.DeleteShader(fragmentShader);
+
+        // Look these up once instead of every frame.
+        resolutionLocation    = gl.GetUniformLocation(shaderProgram, "uResolution");
+        originLocation        = gl.GetUniformLocation(shaderProgram, "uOrigin");
+        timeLocation          = gl.GetUniformLocation(shaderProgram, "uTime");
+        journeyLocation       = gl.GetUniformLocation(shaderProgram, "uJourney");
+        journeyLengthLocation = gl.GetUniformLocation(shaderProgram, "uJourneyLength");
+        maxIterationsLocation = gl.GetUniformLocation(shaderProgram, "uMaxIterations");
+        centerLocation        = gl.GetUniformLocation(shaderProgram, "uCenter");
+
+        vertexArray = gl.GenVertexArray();
+        gl.BindVertexArray(vertexArray);
+
+        gl.ClearColor(0f, 0f, 0f, 1f);
     }
 
     private static void OnRender(double deltaTime)
     {
-        if (window is null || swapchain.Handle is null)
+        if (window is null || gl is null || shaderProgram == 0)
             return;
 
-        Vector2D<int> size = window.FramebufferSize;
+        Vector2D<int> framebuffer = window.FramebufferSize;
 
-        if (size.X <= 0 || size.Y <= 0)
+        if (framebuffer.X <= 0 || framebuffer.Y <= 0)
             return;
+
+        // Draw across the whole window, which spans every monitor.
+        int areaX = 0;
+        int areaY = 0;
+        int areaWidth = framebuffer.X;
+        int areaHeight = framebuffer.Y;
 
         double elapsed = window.Time - startTime;
 
@@ -431,75 +347,55 @@ internal static unsafe class Program
         // ~300 at the start, ~1500 at the deepest point.
         int maxIterations = 300 + (int)(journey * 100.0);
 
-        var parameters = new FractalParams
-        {
-            Resolution = new Vector2(size.X, size.Y),
-            Time = (float)elapsed,
-            Journey = (float)journey,
-            JourneyLength = (float)JourneyLength,
-            MaxIterations = maxIterations,
-            Center = new Vector2((float)zoomTarget.X, (float)zoomTarget.Y)
-        };
+        gl.Viewport(areaX, areaY, (uint)areaWidth, (uint)areaHeight);
 
-        deviceContext.UpdateSubresource(constantBuffer, 0, (Box*)null, &parameters, 0, 0);
+        gl.UseProgram(shaderProgram);
+        gl.BindVertexArray(vertexArray);
 
-        using var backBuffer = swapchain.GetBuffer<ID3D11Texture2D>(0);
+        gl.Uniform2(resolutionLocation, (float)areaWidth, (float)areaHeight);
+        gl.Uniform2(originLocation, (float)areaX, (float)areaY);
+        gl.Uniform1(timeLocation, (float)elapsed);
+        gl.Uniform1(journeyLocation, (float)journey);
+        gl.Uniform1(journeyLengthLocation, (float)JourneyLength);
+        gl.Uniform1(maxIterationsLocation, maxIterations);
+        gl.Uniform2(centerLocation, (float)zoomTarget.X, (float)zoomTarget.Y);
 
-        ComPtr<ID3D11RenderTargetView> renderTargetView = default;
-        SilkMarshal.ThrowHResult(
-            device.CreateRenderTargetView(backBuffer, null, ref renderTargetView));
-
-        deviceContext.ClearRenderTargetView(renderTargetView, ref Black[0]);
-
-        var viewport = new Viewport(0, 0, size.X, size.Y, 0, 1);
-        deviceContext.RSSetViewports(1, in viewport);
-
-        deviceContext.OMSetRenderTargets(
-            1, ref renderTargetView, ref Unsafe.NullRef<ID3D11DepthStencilView>());
-
-        deviceContext.IASetPrimitiveTopology(
-            D3DPrimitiveTopology.D3DPrimitiveTopologyTrianglelist);
-
-        deviceContext.VSSetShader(
-            vertexShader, ref Unsafe.NullRef<ComPtr<ID3D11ClassInstance>>(), 0);
-        deviceContext.PSSetShader(
-            pixelShader, ref Unsafe.NullRef<ComPtr<ID3D11ClassInstance>>(), 0);
-        deviceContext.PSSetConstantBuffers(0, 1, ref constantBuffer);
-
-        deviceContext.Draw(3, 0);
-
-        // 1 = wait for vsync.
-        swapchain.Present(1, 0);
-
-        renderTargetView.Dispose();
+        gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
     }
 
-    private static void OnFramebufferResize(Vector2D<int> size)
+    private static uint CompileShader(ShaderType type, string source)
     {
-        if (swapchain.Handle is null || size.X <= 0 || size.Y <= 0)
-            return;
+        if (gl is null)
+            throw new InvalidOperationException();
 
-        // The back buffer can't be resized while it is still bound.
-        deviceContext.ClearState();
+        uint shader = gl.CreateShader(type);
 
-        swapchain.ResizeBuffers(
-            0, (uint)size.X, (uint)size.Y, Format.FormatB8G8R8A8Unorm, 0);
+        gl.ShaderSource(shader, source);
+        gl.CompileShader(shader);
+
+        gl.GetShader(shader, ShaderParameterName.CompileStatus, out int compileStatus);
+
+        if (compileStatus == 0)
+        {
+            string log = gl.GetShaderInfoLog(shader);
+            gl.DeleteShader(shader);
+
+            throw new Exception("Shader compilation error:\n" + log);
+        }
+
+        return shader;
     }
 
     private static void OnClosing()
     {
-        constantBuffer.Dispose();
-        pixelShader.Dispose();
-        vertexShader.Dispose();
-        swapchain.Dispose();
-        deviceContext.Dispose();
-        device.Dispose();
-        adapter.Dispose();
-        factory.Dispose();
+        if (gl is not null)
+        {
+            if (vertexArray != 0)
+                gl.DeleteVertexArray(vertexArray);
 
-        compiler?.Dispose();
-        d3d11?.Dispose();
-        dxgi?.Dispose();
+            if (shaderProgram != 0)
+                gl.DeleteProgram(shaderProgram);
+        }
 
         input?.Dispose();
     }
