@@ -217,7 +217,7 @@ internal static unsafe class Program
             BufferCount = 2,
             Format = Format.FormatB8G8R8A8Unorm,
             BufferUsage = DXGI.UsageRenderTargetOutput,
-            SwapEffect = SwapEffect.FlipDiscard,
+            SwapEffect = SwapEffect.Discard,   // blit model, like OpenGL; flip model stuttered across mixed monitors
             SampleDesc = new SampleDesc(1, 0)
         };
 
